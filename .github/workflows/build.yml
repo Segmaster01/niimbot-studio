@@ -52,7 +52,7 @@ jobs:
           & $iscc /Qp "/DAppVersion=${{ steps.version.outputs.version }}" installer\NiimbotStudio.iss
           if ($LASTEXITCODE) { throw "ISCC failed" }
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: NiimbotStudio-Setup-${{ steps.version.outputs.version }}
           path: dist/NiimbotStudio-Setup-*.exe
