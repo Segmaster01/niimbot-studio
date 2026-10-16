@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+version_info.txt
+*.nsbrand
+*.tmp
+.vscode/
+.idea/
+testprint.png
+calibration.png
