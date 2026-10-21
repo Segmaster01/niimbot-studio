@@ -42,6 +42,7 @@ class MainWindow(QMainWindow):
         self.device_info = None
         self._asked_barcodes: set[str] = set()
         self._banner_dismissed_for = None
+        self._connect_dialog_open = False
 
         self.doc = Document(LabelSize.from_dict(settings["last_label"]))
         self.view = LabelView(self.doc)
@@ -414,6 +415,7 @@ class MainWindow(QMainWindow):
 
         s = self.service
         s.state_changed.connect(self._on_printer_state)
+        s.connect_failed.connect(self._on_connect_failed)
         s.device_info.connect(self._on_device_info)
         s.status.connect(lambda st: self.printer_panel.set_battery(st.battery))
         s.rfid.connect(self._on_rfid)
@@ -926,11 +928,22 @@ class MainWindow(QMainWindow):
 
     def connect_printer(self):
         dlg = ConnectDialog(self, self.service)
-        if dlg.exec() and dlg.selected():
+        self._connect_dialog_open = True
+        try:
+            accepted = dlg.exec() and dlg.selected()
+        finally:
+            self._connect_dialog_open = False
+        if accepted:
             addr, name = dlg.selected()
             self.settings["printer_address"] = addr
             self.settings["printer_name"] = name
-            self.service.connect_to(addr, name)
+            if not self.service.connected:
+                self.service.connect_to(addr, name)
+
+    def _on_connect_failed(self, msg):
+        if self._connect_dialog_open:
+            return
+        QMessageBox.warning(self, "Couldn't connect", msg)
 
     def _on_printer_state(self, state, msg):
         self.printer_panel.set_state(state, msg, self.service.name or self.settings["printer_name"])
