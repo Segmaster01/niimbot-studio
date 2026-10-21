@@ -17,6 +17,7 @@ from . import __version__, theme
 from . import brand as brand_mod
 from .config import PRESETS, LabelSize, Settings
 from .document import mono_to_qimage
+from .driver import bluetooth_unavailable_message
 from .panels import PreviewWidget, dim, section
 
 
@@ -326,18 +327,33 @@ class ConnectDialog(BaseDialog):
     def __init__(self, parent, service):
         super().__init__(parent, "Connect a printer", 420)
         self.service = service
-        self.lay.addWidget(dim("Switch the printer on. It doesn't need to be paired in Windows settings."))
+        self._devices: list[tuple] = []
+        self._error = None
+        self._connect_error = None
+        self._awaiting_connect = False
+        self._connect_in_progress = False
+        self._scanning = False
+        self._scan_id = None
+        self.lay.addWidget(dim(
+            "Switch the printer on. It doesn't need to be paired in Windows settings. "
+            "Close the Niimbot app on your phone first, because it can hold the printer's connection."))
         self.list = QListWidget()
         self.list.setFixedHeight(160)
         self.list.setIconSize(QSize(20, 20))
         self.lay.addWidget(self.list)
+        self.show_all = QCheckBox("Show all Bluetooth devices")
+        self.show_all.setToolTip(
+            "List every advertising device (name, address, signal, services), for troubleshooting. "
+            "The same list is written to niimbot.log next to settings.json.")
+        self.show_all.toggled.connect(lambda _on: self._refresh_list())
+        self.lay.addWidget(self.show_all)
         self.status = dim("", "faint")
         self.lay.addWidget(self.status)
         self.rescan = QPushButton("Search again")
         self.rescan.clicked.connect(self.scan)
         self.ok = primary("Connect")
         self.ok.setEnabled(False)
-        self.ok.clicked.connect(self.accept)
+        self.ok.clicked.connect(self._start_connect)
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
         row = QHBoxLayout()
@@ -346,39 +362,156 @@ class ConnectDialog(BaseDialog):
         row.addWidget(cancel)
         row.addWidget(self.ok)
         self.lay.addLayout(row)
-        self.list.currentItemChanged.connect(lambda cur: self.ok.setEnabled(cur is not None))
-        self.list.itemDoubleClicked.connect(lambda _: self.accept())
-        service.devices_found.connect(self._found)
+        self.list.currentItemChanged.connect(
+            lambda cur: self.ok.setEnabled(cur is not None and not self._connect_in_progress))
+        self.list.itemDoubleClicked.connect(lambda _: self._start_connect())
+        service.device_detected.connect(self._on_device)
+        service.scan_finished.connect(self._finished)
+        service.connect_failed.connect(self._on_connect_failed)
+        service.state_changed.connect(self._on_state)
         self.scan()
 
     def scan(self):
-        self.list.clear()
-        self.status.setText("Searching for Niimbot printers…")
+        if self._awaiting_connect:
+            self.service.disconnect()
+            self._awaiting_connect = False
+            self._connect_in_progress = False
+        self._devices = []
+        self._error = None
+        self._connect_error = None
+        self._scanning = True
         self.rescan.setEnabled(False)
-        self.service.scan()
+        self._refresh_list()
+        self._scan_id = self.service.scan()
 
-    def _found(self, devices):
+    def _start_connect(self):
+        if not self.selected() or self._connect_in_progress:
+            return
+        self._awaiting_connect = True
+        self._connect_in_progress = True
+        self._connect_error = None
+        self.ok.setEnabled(False)
+        self.rescan.setEnabled(False)
+        self._refresh_list()
+        addr, name = self.selected()
+        self.service.connect_to(addr, name)
+
+    def _on_state(self, state, _msg):
+        if self._awaiting_connect and state == "connected":
+            self._awaiting_connect = False
+            self._connect_in_progress = False
+            self.accept()
+
+    def _on_connect_failed(self, msg):
+        if not self._awaiting_connect:
+            return
+        self._connect_in_progress = False
+        self._connect_error = msg
         self.rescan.setEnabled(True)
+        self._refresh_list()
+        QMessageBox.warning(self, "Couldn't connect", msg)
+
+    def _on_device(self, scan_id, addr, name, rssi, matched, service_uuids=()):
+        if scan_id != self._scan_id:
+            return
+        row = (addr, name or "", rssi, bool(matched), tuple(service_uuids or ()))
+        for i, existing in enumerate(self._devices):
+            if existing[0] == addr:
+                self._devices[i] = row
+                break
+        else:
+            self._devices.append(row)
+        self._refresh_list()
+
+    def _finished(self, scan_id, error):
+        if scan_id != self._scan_id:
+            return
+        self._scanning = False
+        self._error = error or None
+        if not self._connect_in_progress:
+            self.rescan.setEnabled(True)
+        self._refresh_list()
+
+    def _visible(self):
+        if self.show_all.isChecked():
+            return list(self._devices)
+        return [row for row in self._devices if row[3]]
+
+    def _row_text(self, addr, name, rssi, matched, service_uuids=()):
+        if matched and not name:
+            label = "Niimbot printer"
+        else:
+            label = name or "(no name)"
+        text = f"{label}    {addr}"
+        if self.show_all.isChecked():
+            rssi_text = f"{rssi} dBm" if rssi is not None else "rssi n/a"
+            services = ", ".join(service_uuids) if service_uuids else "no services"
+            text += f"    {rssi_text}    {services}"
+        return text
+
+    def _status_text(self):
+        if self._connect_error:
+            return self._connect_error
+        if self._awaiting_connect:
+            sel = self.selected()
+            who = (sel[1] or sel[0]) if sel else "the printer"
+            return f"Connecting to {who}…"
+        if self._error:
+            return bluetooth_unavailable_message(self._error)
+        rows = self._visible()
+        n = len(rows)
+        show_all = self.show_all.isChecked()
+        noun = "device" if show_all else "printer"
+        plural = "s" if n != 1 else ""
+        if self._scanning:
+            if n:
+                return f"Searching… found {n} {noun}{plural}."
+            if show_all:
+                return "Searching for Bluetooth devices…"
+            return "Searching for Niimbot printers…"
+        if n == 0:
+            if show_all:
+                return ("No Bluetooth devices found. Make sure the printer is on and nearby, "
+                        "then search again.")
+            return "No printers found. Make sure it's on and nearby, then search again."
+        return f"Found {n} {noun}{plural}."
+
+    def _refresh_list(self):
+        previous = self.selected()
+        self.list.blockSignals(True)
         self.list.clear()
-        for addr, name in devices:
-            li = QListWidgetItem(theme.icon("bluetooth"), f"{name or 'Niimbot printer'}    {addr}")
+        restore = None
+        for addr, name, rssi, matched, service_uuids in self._visible():
+            li = QListWidgetItem(theme.icon("bluetooth"),
+                                 self._row_text(addr, name, rssi, matched, service_uuids))
             li.setData(Qt.UserRole, (addr, name))
             self.list.addItem(li)
-        if devices:
-            self.list.setCurrentRow(0)
-            self.status.setText(f"Found {len(devices)} printer{'s' if len(devices) != 1 else ''}.")
-        else:
-            self.status.setText("No printers found. Make sure it's on and nearby, then search again.")
+            if previous and previous[0] == addr:
+                restore = self.list.count() - 1
+        if self.list.count() and restore is None:
+            restore = 0
+        if restore is not None:
+            self.list.setCurrentRow(restore)
+        self.list.blockSignals(False)
+        self.ok.setEnabled(self.list.currentItem() is not None and not self._connect_in_progress)
+        self.status.setText(self._status_text())
 
     def selected(self):
         li = self.list.currentItem()
         return li.data(Qt.UserRole) if li else None
 
     def done(self, r):
-        try:
-            self.service.devices_found.disconnect(self._found)
-        except (RuntimeError, TypeError):
-            pass
+        stop = self._awaiting_connect and r != QDialog.Accepted
+        for sig, slot in ((self.service.device_detected, self._on_device),
+                          (self.service.scan_finished, self._finished),
+                          (self.service.connect_failed, self._on_connect_failed),
+                          (self.service.state_changed, self._on_state)):
+            try:
+                sig.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        if stop:
+            self.service.disconnect()
         super().done(r)
 
 

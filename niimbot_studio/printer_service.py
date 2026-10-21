@@ -3,15 +3,33 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from concurrent.futures import Future
 
 from bleak import BleakScanner
 from PIL import Image
 from PySide6.QtCore import QObject, Signal
 
-from .driver import DeviceInfo, NiimbotPrinter, PrinterError, PrinterStatus, RfidInfo, discover
+from .config import APP_DIR
+from .driver import (DISCOVER_SECONDS, NOT_PRINTER_MESSAGE, DeviceInfo, NiimbotPrinter, PrinterError,
+                     PrinterStatus, RfidInfo, bluetooth_unavailable_message, discover,
+                     exception_text, scan_error_reason)
 
 POLL_SECONDS = 4
+BLE_LOG = "niimbot.log"
+
+
+def log_discovered_device(addr, name, rssi, service_uuids):
+    """Append one unfiltered advertisement to the app log (next to settings.json)."""
+    services = ",".join(service_uuids) if service_uuids else "-"
+    rssi_text = "-" if rssi is None else str(rssi)
+    line = f"BLE {addr}  name={name or '-'}  rssi={rssi_text}  services={services}"
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        with (APP_DIR / BLE_LOG).open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {line}\n")
+    except OSError:
+        pass
 
 
 class PrinterService(QObject):
@@ -19,7 +37,9 @@ class PrinterService(QObject):
     device_info = Signal(object)            # DeviceInfo
     status = Signal(object)                 # PrinterStatus
     rfid = Signal(object)                   # RfidInfo | None
-    devices_found = Signal(list)            # [(address, name)]
+    device_detected = Signal(int, str, str, object, bool, object)  # id, addr, name, rssi, matched, uuids
+    scan_finished = Signal(int, str)        # scan id, error reason ("" when the scan succeeded)
+    connect_failed = Signal(str)            # exception type and message
     print_progress = Signal(int, int)       # labels done, total
     print_finished = Signal(bool, str)      # ok, message
 
@@ -37,6 +57,8 @@ class PrinterService(QObject):
         self._cancel = False
         self._poll_task = None
         self._last_rfid_key = object()
+        self._scan_id = 0
+        self._reported_connect_error = False
 
     def _run(self):
         asyncio.set_event_loop(self._loop)
@@ -59,11 +81,15 @@ class PrinterService(QObject):
 
     # ------------------------------------------------------------------ public API
     def scan(self):
-        self._submit(self._scan())
+        self._scan_id += 1
+        scan_id = self._scan_id
+        self._submit(self._scan(scan_id))
+        return scan_id
 
     def connect_to(self, address: str, name: str = ""):
         self.address, self.name = address, name
         self._want_connected = True
+        self._reported_connect_error = False
         self._submit(self._connect())
 
     def disconnect(self):
@@ -91,12 +117,21 @@ class PrinterService(QObject):
 
     def shutdown(self):
         self._want_connected = False
-        fut = self._submit(self._disconnect())
+        fut = self._submit(self._shutdown())
         try:
             fut.result(timeout=4)
         except Exception:  # noqa: BLE001
             pass
         self._loop.call_soon_threadsafe(self._loop.stop)
+
+    async def _shutdown(self):
+        await self._disconnect()
+        current = asyncio.current_task()
+        tasks = [task for task in asyncio.all_tasks() if task is not current]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # ------------------------------------------------------------------ coroutines
     async def _call(self, fn):
@@ -107,15 +142,29 @@ class PrinterService(QObject):
         except Exception:  # noqa: BLE001
             return False
 
-    async def _scan(self):
+    async def _scan(self, scan_id):
         self._set_state("scanning", "Searching for printers…")
+
+        def on_device(addr, name, rssi, matched, service_uuids=()):
+            if scan_id != self._scan_id:
+                return
+            uuids = tuple(service_uuids or ())
+            self.device_detected.emit(scan_id, addr, name, rssi, matched, uuids)
+            log_discovered_device(addr, name, rssi, uuids)
+
         try:
-            found = await discover(6)
+            await discover(DISCOVER_SECONDS, on_device)
         except Exception as e:  # noqa: BLE001
-            self.devices_found.emit([])
-            self._set_state("disconnected", f"Bluetooth unavailable: {e}")
+            if scan_id != self._scan_id:
+                return
+            reason = scan_error_reason(e)
+            self.scan_finished.emit(scan_id, reason)
+            if self.state == "scanning":
+                self._set_state("disconnected", bluetooth_unavailable_message(reason))
             return
-        self.devices_found.emit(found)
+        if scan_id != self._scan_id:
+            return
+        self.scan_finished.emit(scan_id, "")
         if self.state == "scanning":
             self._set_state("disconnected", "")
 
@@ -126,13 +175,14 @@ class PrinterService(QObject):
         while self._want_connected:
             self._set_state("connecting", f"Connecting to {self.name or self.address}…")
             try:
+                # Address only: a D11 often has no service UUID in the advertisement.
                 dev = await BleakScanner.find_device_by_address(self.address, timeout=8)
                 if dev is None:
                     raise PrinterError("Printer not found. Is it switched on and in range?")
                 self.name = dev.name or self.name
                 printer = NiimbotPrinter(self.address)
                 printer.on_disconnect = lambda: self._loop.call_soon_threadsafe(self._on_lost)
-                await printer.connect()
+                await printer.connect(dev)
                 self.printer = printer
                 info = await printer.get_device_info()
                 self.device_info.emit(info)
@@ -144,7 +194,14 @@ class PrinterService(QObject):
                 return
             except Exception as e:  # noqa: BLE001
                 self.printer = None
-                self._set_state("disconnected", str(e) or e.__class__.__name__)
+                msg = exception_text(e)
+                self._set_state("disconnected", msg)
+                if not self._reported_connect_error:
+                    self._reported_connect_error = True
+                    self.connect_failed.emit(msg)
+                if NOT_PRINTER_MESSAGE in str(e):
+                    self._want_connected = False
+                    return
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
 

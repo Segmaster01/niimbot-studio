@@ -11,10 +11,16 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 from bleak import BleakClient, BleakScanner
+from bleak.exc import BleakBluetoothNotAvailableError
 from PIL import Image
 
 SERVICE_UUID = "e7810a71-73ae-499d-8c15-faa9aef0c3f2"
 CHAR_UUID = "bef8d6c9-9c21-4c9e-b632-bd58c1009f9f"
+PRINTER_NAME_PREFIXES = ("D11",)  # add others here, e.g. "D110", "B21"
+DISCOVER_SECONDS = 12.0
+NOT_PRINTER_MESSAGE = (
+    "This device is not a Niimbot printer (the expected Bluetooth service was not found)."
+)
 
 PRINTHEAD_PX = 96  # D11: 12 mm @ 203 dpi
 DPI = 203
@@ -150,16 +156,119 @@ class DeviceInfo:
     battery: int = 0
 
 
-async def discover(timeout: float = 6.0) -> list[tuple[str, str]]:
-    """Return [(address, name)] of nearby Niimbot printers."""
-    found = await BleakScanner.discover(timeout=timeout, return_adv=True)
-    result = []
-    for addr, (dev, adv) in found.items():
-        name = dev.name or adv.local_name or ""
-        uuids = [u.lower() for u in adv.service_uuids]
-        if SERVICE_UUID in uuids:
-            result.append((addr, name))
-    return result
+def _norm_uuid(value) -> str:
+    return str(value).strip().strip("{}").lower()
+
+
+def matches_printer(*names: str | None, service_uuids=()) -> bool:
+    """True if an advertisement is a Niimbot printer.
+
+    The D11 usually omits the printer service from the advertisement and only
+    exposes it after a connection, so a name prefix is enough to list it.
+    """
+    for uid in service_uuids or []:
+        if _norm_uuid(uid) == SERVICE_UUID:
+            return True
+    for name in names:
+        text = (name or "").strip().upper()
+        if text and any(text.startswith(prefix.upper()) for prefix in PRINTER_NAME_PREFIXES):
+            return True
+    return False
+
+
+def advertised_service_uuids(values) -> tuple[str, ...]:
+    found = []
+    for uid in values or []:
+        norm = _norm_uuid(uid)
+        if norm and norm not in found:
+            found.append(norm)
+    return tuple(found)
+
+
+def _display_name(device_name: str, local_name: str) -> str:
+    for candidate in (device_name, local_name):
+        if matches_printer(candidate):
+            return candidate.strip()
+    return (device_name or local_name).strip()
+
+
+def has_printer_gatt(services) -> bool:
+    if services is None:
+        return False
+    return (services.get_service(SERVICE_UUID) is not None
+            and services.get_characteristic(CHAR_UUID) is not None)
+
+
+def _exception_line(exc: BaseException) -> str:
+    """`Type: message`. Bleak's not-available error stringifies as a tuple, so use its text arg."""
+    name = type(exc).__name__
+    if isinstance(exc, BleakBluetoothNotAvailableError):
+        msg = exc.args[0].strip() if exc.args and isinstance(exc.args[0], str) else ""
+    else:
+        msg = str(exc).strip()
+    if not msg or msg == name:
+        return name
+    return f"{name}: {msg}"
+
+
+def exception_text(exc: BaseException) -> str:
+    """Exception type and message, then an explicit `raise ... from` cause."""
+    lines = []
+    seen = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen and len(lines) < 4:
+        seen.add(id(cur))
+        lines.append(_exception_line(cur))
+        cur = cur.__cause__
+    return "\n".join(lines)
+
+
+def scan_error_reason(exc: BaseException) -> str:
+    """Plain reason for a failed scan, without the exception type prefix."""
+    line = _exception_line(exc)
+    name = type(exc).__name__
+    prefix = f"{name}: "
+    return line[len(prefix):] if line.startswith(prefix) else line
+
+
+def bluetooth_unavailable_message(reason: str) -> str:
+    reason = (reason or "the Bluetooth scan failed").strip().rstrip(".")
+    return (
+        f"Bluetooth unavailable: {reason}. "
+        "Check that Bluetooth is on and Settings > Privacy & security > Radios "
+        "allows apps to control radios."
+    )
+
+
+async def discover(timeout: float = DISCOVER_SECONDS, detection_callback=None
+                   ) -> list[tuple[str, str]]:
+    """Return [(address, name)] of nearby Niimbot printers.
+
+    detection_callback(address, name, rssi, matched, service_uuids) runs for every device seen,
+    including ones that are not printers.
+    Devices that are not printers are reported with matched=False and left out of the result.
+    """
+    seen: dict[str, tuple] = {}
+
+    def _on_detect(device, adv):
+        addr = device.address
+        device_name = getattr(device, "name", None) or ""
+        local_name = getattr(adv, "local_name", None) or ""
+        uuids = advertised_service_uuids(getattr(adv, "service_uuids", None))
+        matched = matches_printer(device_name, local_name, service_uuids=uuids)
+        name = _display_name(device_name, local_name)
+        key = (name, matched, uuids)
+        if seen.get(addr) == key:
+            return
+        seen[addr] = key
+        if detection_callback is not None:
+            detection_callback(addr, name, getattr(adv, "rssi", None), matched, uuids)
+
+    found = await BleakScanner.discover(timeout=timeout, return_adv=True,
+                                        detection_callback=_on_detect)
+    for _addr, (device, adv) in found.items():
+        _on_detect(device, adv)
+    return [(addr, name) for addr, (name, matched, _uuids) in seen.items() if matched]
 
 
 class NiimbotPrinter:
@@ -174,11 +283,18 @@ class NiimbotPrinter:
         self.page_index = 0  # updated by unsolicited In_PrinterPageIndex (0xE0)
 
     # ---------------------------------------------------------------- transport
-    async def connect(self):
-        self.client = BleakClient(self.address, timeout=20,
+    async def connect(self, device=None):
+        # No pairing. `device` is the BLEDevice from the address scan, so Windows does not scan again.
+        self.client = BleakClient(device or self.address, timeout=20,
                                   disconnected_callback=self._disconnected)
-        await self.client.connect()
-        await self.client.start_notify(CHAR_UUID, self._notify)
+        try:
+            await self.client.connect()
+            if not has_printer_gatt(self.client.services):
+                raise PrinterError(NOT_PRINTER_MESSAGE)
+            await self.client.start_notify(CHAR_UUID, self._notify)
+        except Exception:
+            await self.disconnect()
+            raise
 
     def _disconnected(self, _client):
         if self.on_disconnect:
